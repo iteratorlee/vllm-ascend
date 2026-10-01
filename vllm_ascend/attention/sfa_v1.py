@@ -581,6 +581,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         ) or _has_shared_indexer_layers(config_candidates)
         self.use_index_cache = self.skip_topk or self.index_cache_enabled
         self.has_indexer = self.indexer is not None
+        self.reuse_indexer_projection = self.is_kv_consumer and ascend_config.enable_indexer_projection_reuse
         if not self.has_indexer and not self.skip_topk:
             raise ValueError(
                 "Indexer is required for DSA unless skip_topk is enabled. "
@@ -1391,11 +1392,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return hidden_states, ql_nope, q_pe, q_c
 
+    def _project_indexer_for_reuse(self, x: torch.Tensor) -> torch.Tensor | None:
+        if not self.reuse_indexer_projection or not self.has_indexer or self.skip_topk:
+            return None
+        assert self.wk_weights_proj is not None
+        return self.wk_weights_proj(x)[0]
+
     def indexer_select_pre_process(
         self,
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        projected_kw: torch.Tensor | None = None,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -1405,7 +1413,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.wk_weights_proj is not None
         assert self.k_norm is not None
 
-        kw, _ = self.wk_weights_proj(x)
+        if projected_kw is None:
+            kw, _ = self.wk_weights_proj(x)
+        else:
+            kw = projected_kw
         k_li = kw[:, : self.head_dim]
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
@@ -1450,6 +1461,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        projected_kw: torch.Tensor | None = None,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -1459,7 +1471,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.wk_weights_proj is not None
         assert self.wq_b is not None
 
-        kw, _ = self.wk_weights_proj(x)
+        if projected_kw is None:
+            kw, _ = self.wk_weights_proj(x)
+        else:
+            kw = projected_kw
         weights = kw[:, self.head_dim :]
         if isinstance(q_c, tuple):
             q_c_tensor, q_c_scale = q_c
@@ -1863,6 +1878,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.SpecDecoding,
         }
 
+        # Keep the projection local to this forward. MTP iterations and graph
+        # replays must never reuse a previous hidden state's projection.
+        indexer_projection: torch.Tensor | None = None
         fused_type: PreprocessType = self.preprocess_type
         if (
             attn_metadata.attn_state not in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
@@ -1882,7 +1900,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping.numel()}."
                 )
             if self.has_indexer:
-                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+                indexer_projection = self._project_indexer_for_reuse(hidden_states)
+                k_li, k_li_scale = self.indexer_select_pre_process(
+                    x=hidden_states, cos=cos, sin=sin, projected_kw=indexer_projection
+                )
             else:
                 k_li, k_li_scale = None, None
             wait_for_kv_layer_from_connector(layer_name)
@@ -1920,10 +1941,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_c = self.q_a_layernorm(q_c)
 
             if self.has_indexer:
+                indexer_projection = self._project_indexer_for_reuse(hidden_states)
                 k_li, k_li_scale = self.indexer_select_pre_process(
                     x=hidden_states,
                     cos=cos,
                     sin=sin,
+                    projected_kw=indexer_projection,
                 )
             else:
                 k_li, k_li_scale = None, None
@@ -2048,6 +2071,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                projected_kw=indexer_projection,
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
