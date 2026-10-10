@@ -58,7 +58,14 @@ async def main():
             "ignore_eos": True,
             "stream": False,
             "cache_salt": p_salt,
-            "kv_transfer_params": {"do_remote_decode": False, "do_remote_prefill": False},
+            "kv_transfer_params": {
+                "do_remote_decode": False,
+                "do_remote_prefill": False,
+                "remote_engine_id": None,
+                "remote_block_ids": None,
+                "remote_host": None,
+                "remote_port": None,
+            },
         }
         p_before = await client.get(p_url + "/metrics")
         p_before.raise_for_status()
