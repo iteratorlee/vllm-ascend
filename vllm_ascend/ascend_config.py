@@ -291,6 +291,10 @@ class AscendConfig:
         if not isinstance(enable_indexer_projection_reuse, bool):
             raise ValueError("enable_indexer_projection_reuse must be a bool.")
         self.enable_indexer_projection_reuse = enable_indexer_projection_reuse and use_sparse
+        enable_fused_indexer_cache_write = additional_config.get("enable_fused_indexer_cache_write", False)
+        if not isinstance(enable_fused_indexer_cache_write, bool):
+            raise ValueError("enable_fused_indexer_cache_write must be a bool.")
+        self.enable_fused_indexer_cache_write = enable_fused_indexer_cache_write and use_sparse
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )

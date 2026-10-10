@@ -49,6 +49,7 @@ from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
 )
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
+from vllm_ascend.ops.triton.fused_indexer_cache_write import fused_indexer_cache_write
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
@@ -582,6 +583,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.use_index_cache = self.skip_topk or self.index_cache_enabled
         self.has_indexer = self.indexer is not None
         self.reuse_indexer_projection = self.is_kv_consumer and ascend_config.enable_indexer_projection_reuse
+        self.enable_fused_indexer_cache_write = self.is_kv_consumer and ascend_config.enable_fused_indexer_cache_write
         if not self.has_indexer and not self.skip_topk:
             raise ValueError(
                 "Indexer is required for DSA unless skip_topk is enabled. "
@@ -2007,7 +2009,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             dsa_k_cache_idx = self.kv_cache_indexer_k_idx
             dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
 
-            if use_li_c8_reshape_optim:
+            # The direct token-slot writer does not consume group metadata.
+            # Keep the existing block writer and unsupported layouts intact.
+            fused_li_written = False
+            if (
+                HAS_TRITON
+                and self.enable_fused_indexer_cache_write
+                and self.enable_sparse_li_c8
+                and k_li_scale is not None
+            ):
+                assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
+                if not use_li_c8_reshape_optim:
+                    fused_li_written = fused_indexer_cache_write(
+                        kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
+                        kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
+                        slot_mapping.view(-1),
+                        k_li.view(-1, k_li.shape[-1]),
+                        k_li_scale.view(-1, k_li_scale.shape[-1]),
+                    )
+
+            if not fused_li_written and use_li_c8_reshape_optim:
                 torch.ops._C_ascend.store_kv_block(
                     k_li,
                     kv_cache[dsa_k_cache_idx],
@@ -2016,13 +2037,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.group_key_cache_idx,
                     attn_metadata.block_size,
                 )
-            else:
+            elif not fused_li_written:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
                     slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
-            if self.enable_sparse_li_c8:
+            if self.enable_sparse_li_c8 and not fused_li_written:
                 assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
                 if k_li_scale is not None:
                     if use_li_c8_reshape_optim:
