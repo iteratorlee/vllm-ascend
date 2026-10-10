@@ -22,7 +22,7 @@ async def main():
     args = parser.parse_args()
     sys.path.insert(0, str(args.root / "bench"))
     # The existing benchmark supplies the deployed PD protocol and metrics.
-    from bench_saturation import request, sample_node, write_client_events
+    from bench_saturation import parse_metrics, request, sample_node, write_client_events
 
     args.output.mkdir(parents=True, exist_ok=True)
     p_url = "http://172.16.10.181:9081"
@@ -77,6 +77,10 @@ async def main():
         p_after = await client.get(p_url + "/metrics")
         p_after.raise_for_status()
         (args.output / "p-after.prom").write_text(p_after.text)
+        before_metrics, after_metrics = parse_metrics(p_before.text), parse_metrics(p_after.text)
+        p_prefix_delta = {key: after_metrics[key] - before_metrics[key] for key in ("prefix_hits", "prefix_queries")}
+        if p_prefix_delta["prefix_hits"] != 0 or p_prefix_delta["prefix_queries"] <= 0:
+            raise RuntimeError(f"P profiling did not verify cold-prefix computation: {p_prefix_delta}")
 
         workload = SimpleNamespace(
             prefill_url=p_url,
@@ -139,6 +143,7 @@ async def main():
                     "scope": "diagnostic profiling only, excluded from C03 performance comparison",
                     "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                     "p": {"prompt_tokens": 131072, "output_tokens": 1, "new_prefix_salt": p_salt},
+                    "p_prefix_counter_delta": p_prefix_delta,
                     "d": {"requests": 16, "client_concurrency": 16, "observed_running": [2, 2]},
                     "decode_window_s": args.decode_window_s,
                 },
