@@ -26,6 +26,19 @@ docker exec "$container" bash -lc '
 cd /vllm-workspace/vllm-ascend
 git diff
 ' > "$profile/config/runtime-before-$role.patch"
+docker exec -e PROFILE_DIRECTORY="$profile" "$container" bash -lc '
+set -euo pipefail
+cd /vllm-workspace/vllm-ascend
+patch="$PROFILE_DIRECTORY/code/record-shapes-runtime.patch"
+if git apply --reverse --check "$patch" 2>/dev/null; then
+    echo "Profiling shape forwarding is already applied"
+else
+    git apply --check "$patch"
+    git apply "$patch"
+fi
+sha256sum vllm_ascend/profiler/torch_npu_profiler.py
+git diff
+' > "$profile/config/profiling-patch-$role.log"
 docker restart "$container" > "$profile/config/restart-$role.log"
 docker exec \
     -e PERF_MODE=optimized -e DECODE_SCENE=dp2tp16 \

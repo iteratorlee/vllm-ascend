@@ -37,6 +37,7 @@ def main():
             "torch_profiler_dir": str(args.output / "trace" / side),
             "torch_profiler_with_stack": False,
             "torch_profiler_with_memory": False,
+            "torch_profiler_record_shapes": True,
             "ignore_frontend": True,
             "capture_torch_profiler": False,
             "max_iterations": 0,
