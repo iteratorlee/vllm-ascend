@@ -31,6 +31,7 @@ from vllm.model_executor.layers.rotary_embedding import (
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import has_rope, is_vl_model
@@ -130,15 +131,24 @@ def _record_cos_and_sin_cache(cos_cache, sin_cache):
     _sin_cache = sin_cache
 
 
-def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
+def _record_cos_and_sin_cache_interleaved(cos_sin_cache: torch.Tensor, *, make_contiguous: bool = False) -> None:
     global _cos_cache
     global _sin_cache
     if _cos_cache is not None or _sin_cache is not None:
         return
     hidden_dim = cos_sin_cache.shape[-1] // 2
     cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2).chunk(2, dim=1)
-    _cos_cache = cos_cache.squeeze(1)
-    _sin_cache = sin_cache.squeeze(1)
+    cos_cache = cos_cache.squeeze(1)
+    sin_cache = sin_cache.squeeze(1)
+    if make_contiguous:
+        # Keep the existing repeat layout and dtype byte-for-byte. Dense tables
+        # avoid torch-npu indexing materializing both full strided views on each
+        # lookup. Once these local views are released, the shared repeat storage
+        # is freed; the two dense tables have the same total resident size.
+        cos_cache = cos_cache.contiguous()
+        sin_cache = sin_cache.contiguous()
+    _cos_cache = cos_cache
+    _sin_cache = sin_cache
 
 
 def update_cos_sin(positions):
@@ -243,7 +253,9 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         vllm_config = get_current_vllm_config()
         self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
         _record_cos_sin_cache(self.cos_sin_cache)
-        _record_cos_and_sin_cache_interleaved(self.cos_sin_cache)
+        _record_cos_and_sin_cache_interleaved(
+            self.cos_sin_cache, make_contiguous=get_ascend_config().enable_mla_rope_cache_contiguous
+        )
 
     def forward_oot(
         self,

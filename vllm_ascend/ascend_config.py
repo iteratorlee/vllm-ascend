@@ -295,6 +295,17 @@ class AscendConfig:
         if not isinstance(enable_fused_indexer_cache_write, bool):
             raise ValueError("enable_fused_indexer_cache_write must be a bool.")
         self.enable_fused_indexer_cache_write = enable_fused_indexer_cache_write and use_sparse
+        # Avoid materializing a full strided RoPE table on every position lookup.
+        # Experimental and disabled by default; enable only for sparse PD decode.
+        enable_mla_rope_cache_contiguous = additional_config.get("enable_mla_rope_cache_contiguous", False)
+        if not isinstance(enable_mla_rope_cache_contiguous, bool):
+            raise ValueError("enable_mla_rope_cache_contiguous must be a bool.")
+        self.enable_mla_rope_cache_contiguous = bool(
+            enable_mla_rope_cache_contiguous
+            and use_sparse
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        )
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )
