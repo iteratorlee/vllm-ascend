@@ -22,12 +22,23 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+# Native Mooncake AscendDirectTransport/FindAdxlListenPort constants.
+MOONCAKE_ADXL_DEFAULT_BASE_PORT = 20000
+MOONCAKE_ADXL_PORT_STRIDE = 100
+MOONCAKE_ADXL_MIN_PORT = 1024
+MOONCAKE_ADXL_MAX_PORT = 65535
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Existing Mooncake Ascend-direct native setting, not a new variable.
+    # Unadjusted base defaults to 20000. The optional worker startup control
+    # requires an integer in [1024, 65535], with the full device window in range.
+    # This setting is not sensitive. Reading it never modifies the environment.
+    "ASCEND_BASE_PORT": lambda: os.getenv("ASCEND_BASE_PORT", str(MOONCAKE_ADXL_DEFAULT_BASE_PORT)),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
@@ -118,3 +129,44 @@ def __getattr__(name: str):
 
 def __dir__():
     return list(env_variables.keys())
+
+
+def get_mooncake_adxl_base_port() -> int:
+    """Read the existing native base without applying a device offset."""
+    value = env_variables["ASCEND_BASE_PORT"]()
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("ASCEND_BASE_PORT must be an unsigned decimal integer.")
+    base_port = int(value)
+    if not MOONCAKE_ADXL_MIN_PORT <= base_port <= MOONCAKE_ADXL_MAX_PORT:
+        raise ValueError("ASCEND_BASE_PORT must be in [1024, 65535].")
+    return base_port
+
+
+def configure_mooncake_disjoint_adxl_ports(
+    physical_device_id: int,
+    previous_assignment: tuple[int, int, int] | None,
+) -> tuple[int, int, int]:
+    """Set the native base once and return (original base, device, native base).
+
+    Mooncake selects inclusively from [native_base + 100*d,
+    native_base + 100*(d+1)]. Adding d to the original base separates these
+    ranges. The worker owns the immutable assignment; this module keeps no
+    process-global assignment state and never retries native initialization.
+    """
+    if type(physical_device_id) is not int or physical_device_id < 0:
+        raise ValueError("Mooncake physical device ID must be a nonnegative integer.")
+    if previous_assignment is not None:
+        base_port, previous_device_id, native_base = previous_assignment
+        if physical_device_id != previous_device_id:
+            raise RuntimeError("Mooncake ADXL physical device changed after port assignment.")
+        if os.environ.get("ASCEND_BASE_PORT") != str(native_base):
+            raise RuntimeError("ASCEND_BASE_PORT changed after the worker's ADXL port assignment.")
+        return previous_assignment
+    base_port = get_mooncake_adxl_base_port()
+    native_base = base_port + physical_device_id
+    max_port = native_base + MOONCAKE_ADXL_PORT_STRIDE * (physical_device_id + 1)
+    if max_port > MOONCAKE_ADXL_MAX_PORT:
+        raise ValueError("Mooncake ADXL physical device range exceeds TCP port 65535.")
+    assignment = (base_port, physical_device_id, native_base)
+    os.environ["ASCEND_BASE_PORT"] = str(native_base)
+    return assignment

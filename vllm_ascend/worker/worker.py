@@ -140,6 +140,8 @@ class NPUWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        self._mooncake_adxl_port_assignment: tuple[int, int, int] | None = None
+
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
         else:
@@ -382,6 +384,23 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _configure_mooncake_disjoint_adxl_ports(self) -> None:
+        if not get_ascend_config().enable_mooncake_disjoint_adxl_ports:
+            return
+        physical_device_id = current_platform.device_id_to_physical_device_id(self.local_rank)
+        self._mooncake_adxl_port_assignment = envs_ascend.configure_mooncake_disjoint_adxl_ports(
+            physical_device_id, self._mooncake_adxl_port_assignment
+        )
+        original_base, device_id, native_base = self._mooncake_adxl_port_assignment
+        logger.info(
+            "Mooncake disjoint ADXL ports: physical_device=%d, original_base=%d, native_base=%d, range=[%d,%d]",
+            device_id,
+            original_base,
+            native_base,
+            native_base + envs_ascend.MOONCAKE_ADXL_PORT_STRIDE * device_id,
+            native_base + envs_ascend.MOONCAKE_ADXL_PORT_STRIDE * (device_id + 1),
+        )
+
     def _init_device(self):
         # vLLM v0.24.0 (PR #45026) removed automatic per-process device
         # isolation for DP workers. Mirror gpu_worker.py::init_device:
@@ -429,6 +448,7 @@ class NPUWorker(WorkerBase):
             )
 
         visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
+        self._configure_mooncake_disjoint_adxl_ports()
         device = torch.device(f"{current_platform.device_type}:{visible_device_index}")
 
         torch.npu.set_device(device)

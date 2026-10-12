@@ -330,6 +330,26 @@ class AscendConfig:
                     "hidden_size=6144, n_routed_experts=256, TP16/DP2/EP, no LoRA and enable_fused_mc2=0."
                 )
         self.enable_moe_native_local_pad_slice = enable_moe_native_local_pad_slice
+        # Startup-only workaround for the current Ascend-direct Mooncake
+        # allocator's overlapping inclusive per-device port ranges.
+        enable_mooncake_disjoint_adxl_ports = additional_config.get("enable_mooncake_disjoint_adxl_ports", False)
+        if not isinstance(enable_mooncake_disjoint_adxl_ports, bool):
+            raise ValueError("enable_mooncake_disjoint_adxl_ports must be a bool.")
+        if enable_mooncake_disjoint_adxl_ports:
+            kv_config = vllm_config.kv_transfer_config
+            if (
+                kv_config is None
+                or kv_config.kv_role != "kv_consumer"
+                or kv_config.kv_connector != "MooncakeConnectorV1"
+                or kv_config.kv_connector_module_path is not None
+                or kv_config.kv_connector_extra_config.get("use_ascend_direct") is not True
+            ):
+                raise ValueError(
+                    "enable_mooncake_disjoint_adxl_ports requires the built-in "
+                    "MooncakeConnectorV1 kv_consumer with use_ascend_direct=true."
+                )
+        self.enable_mooncake_disjoint_adxl_ports = enable_mooncake_disjoint_adxl_ports
+
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )
