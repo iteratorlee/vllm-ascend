@@ -46,7 +46,12 @@ python3 tools/glm52_c16/probe.py --run-npu \
 
 One visible logical NPU is mandatory. The probe checks all raw bits against
 both CPU and device original pad/split, distinct output storage, ND format,
-input immutability, and physical NZ rejection. At N12/P16 every rank is checked
+input immutability, and physical NZ rejection when the backend allows creating
+NZ tensors. The installed `allow_internal_format=False` may return ND despite a
+request for NZ; the probe records that negative fixture as unavailable without
+changing backend options, then asserts the resulting ND tensors remain eligible.
+Four CPU metadata mocks check non-ND inputs and a missing format getter; an ND
+mock checks eligibility. These are not physical NPU evidence. At N12/P16 every rank is checked
 through actual native GLM gating and standalone native dynamic quant in graph
 mode, with three input updates and fixed input/output addresses. Additional
 shapes include N0, N2, N6, N16/P32, N17/P32 and N192/P208 boundaries.

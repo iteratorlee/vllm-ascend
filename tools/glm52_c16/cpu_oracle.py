@@ -3,8 +3,10 @@
 
 import argparse
 import ast
+import hashlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from common import (
     PREPARE_SHA256,
@@ -104,6 +106,36 @@ def main():
         )
         assert candidate(*empty, 16, 16, 0) is None
         result["rejected_layout_shape_dtype_rank_cases"] = len(rejected) + 1
+        # Metadata-only negative guard proof, never called a physical NPU test.
+        fake_device = SimpleNamespace(type="npu")
+
+        class MetadataTensor:
+            def __init__(self, tensor, physical_format):
+                self.tensor = tensor
+                self.device = fake_device
+                self.physical_format = physical_format
+
+            def __getattr__(self, name):
+                return getattr(self.tensor, name)
+
+        format_candidate = NativeLocalPadSlice(
+            torch, "npu", lambda tensor: tensor.physical_format
+        )
+        for hidden_format, logits_format in ((29, 2), (2, 29), (29, 29)):
+            metadata = (
+                MetadataTensor(inputs[0], hidden_format),
+                MetadataTensor(inputs[1], logits_format),
+            )
+            assert format_candidate(*metadata, 16, 16, 0) is None
+        nd_metadata = tuple(MetadataTensor(tensor, 2) for tensor in inputs)
+        assert NativeLocalPadSlice(torch, "npu")(*nd_metadata, 16, 16, 0) is None
+        nd_output = format_candidate(*nd_metadata, 16, 16, 0)
+        assert nd_output is not None
+        byte_check(
+            torch, nd_output, baseline(torch, *inputs, 16, 0), "ND metadata mock"
+        )
+        result["npu_format_metadata_mock_negative_cases"] = 4
+        result["npu_format_metadata_mock_nd_positive"] = True
         expected = baseline(torch, *inputs, 16, 0)
         mutants = {
             "wrong_rank": baseline(torch, *inputs, 16, 1),
@@ -143,9 +175,9 @@ def main():
             for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "prepare"
         )
-        result["original_prepare_ast_sha256"] = (
-            __import__("hashlib").sha256(ast.dump(prepare).encode()).hexdigest()
-        )
+        result["original_prepare_ast_sha256"] = hashlib.sha256(
+            ast.dump(prepare).encode()
+        ).hexdigest()
         result["backend_modules_loaded"] = forbidden
         result["scope"] = (
             "standalone native shard helper; no production prepare integration"

@@ -337,12 +337,33 @@ def main():
                 del captures, functions
                 gc.collect()
         hidden, logits = probe.finite_inputs(12, weight, 99)
+        result["physical_format_negative_fixture"] = []
         for index, tensor in enumerate((hidden, logits)):
             nz = torch_npu.npu_format_cast(tensor, 29)
-            assert torch_npu.get_npu_format(nz) == 29
-            unsupported = (nz, logits) if index == 0 else (hidden, nz)
-            assert probe.candidate(*unsupported, 16, 16, 0) is None
-        result["physical_nz_rejected"] = True
+            actual_format = torch_npu.get_npu_format(nz)
+            record = dict(
+                input_index=index, requested_format=29, actual_format=actual_format
+            )
+            if actual_format == 29:
+                unsupported = (nz, logits) if index == 0 else (hidden, nz)
+                assert probe.candidate(*unsupported, 16, 16, 0) is None
+                record["status"] = "physical_nz_rejected"
+            else:
+                # Installed allow_internal_format=False returns ND despite a
+                # request for NZ. Do not mutate backend options to force a test.
+                assert actual_format == 2, record
+                nd_inputs = (nz, logits) if index == 0 else (hidden, nz)
+                nd_outputs = probe.candidate(*nd_inputs, 16, 16, 0)
+                assert nd_outputs is not None
+                probe.check(
+                    nd_outputs,
+                    probe.baseline(*nd_inputs, 16, 0),
+                    "ND cast remains eligible",
+                )
+                record["status"] = "unavailable_backend_returned_nd"
+                record["actual_nd_positive_eligible"] = True
+            result["physical_format_negative_fixture"].append(record)
+        save(args.output, result)
         # Graph timing first: eager-only improvement is insufficient.
         for mode in ("graph", "eager"):
             for rank in args.timing_ranks:
