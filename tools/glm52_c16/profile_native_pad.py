@@ -49,6 +49,8 @@ def main():
     assert torch.npu.mem_get_info()[0] >= 1024**3
     probe = Probe(torch, torch_npu)
     weight, bias, provenance = probe.checkpoint_gate(args.checkpoint)
+    if provenance != validated.get("checkpoint_gate"):
+        raise RuntimeError("Checkpoint gate provenance differs from paired evidence")
     inputs = probe.finite_inputs(12, weight, 7)
     functions = probe.functions(inputs, 16, args.rank, "native_routing", bias)
     fn = functions[args.variant]
@@ -67,6 +69,7 @@ def main():
             rank=args.rank,
             checkpoint=provenance,
             validated_result=str(args.validated_result),
+            validated_result_sha256=sha(args.validated_result),
             scope="prepare plus native routing; no dispatch",
             profiler_level="Level1",
             record_shapes=True,
