@@ -244,7 +244,10 @@ class MC2CommImpl(MoECommMethod):
         return TokenDispatcherWithMC2()
 
     def _get_prepare_finalize(self):
-        return PrepareAndFinalizeWithMC2(self.moe_config)
+        return PrepareAndFinalizeWithMC2(
+            self.moe_config,
+            enable_native_local_pad_slice=get_ascend_config().enable_moe_native_local_pad_slice,
+        )
 
 
 class AlltoAllCommImpl(MoECommMethod):

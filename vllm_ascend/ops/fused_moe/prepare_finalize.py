@@ -240,9 +240,17 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
     Relies on `mc2_mask` and `padded_num_tokens` from forward_context for alignment.
     """
 
-    def __init__(self, moe_config: FusedMoEConfig):
+    def __init__(self, moe_config: FusedMoEConfig, *, enable_native_local_pad_slice: bool = False) -> None:
         super().__init__(moe_config)
         self._restore_tp_across_dp()
+        if not isinstance(enable_native_local_pad_slice, bool):
+            raise ValueError("enable_native_local_pad_slice must be a bool.")
+        self._native_local_pad_slice = None
+        if enable_native_local_pad_slice:
+            # Disabled instances keep the original path without importing the helper.
+            from vllm_ascend.ops.fused_moe.native_local_pad_slice import maybe_moe_native_local_pad_slice
+
+            self._native_local_pad_slice = maybe_moe_native_local_pad_slice
 
     def _restore_tp_across_dp(self):
         """
@@ -285,6 +293,19 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             self.num_tokens, _ = hidden_states.shape
             target_pad_length = _EXTRA_CTX.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
+
+            if pad_size > 0 and self._native_local_pad_slice is not None:
+                local = self._native_local_pad_slice(
+                    hidden_states, router_logits, target_pad_length, self.tp_size, self.tp_rank
+                )
+                if local is not None:
+                    return MoEPrepareOutput(
+                        hidden_states=local[0],
+                        router_logits=local[1],
+                        mc2_mask=mc2_mask,
+                        padded_hidden_states_shape=torch.Size((target_pad_length, hidden_states.shape[1])),
+                        pertoken_scale=None,
+                    )
 
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))

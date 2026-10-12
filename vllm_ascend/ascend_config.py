@@ -306,6 +306,30 @@ class AscendConfig:
             and vllm_config.kv_transfer_config is not None
             and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
+        # Experimental native local padding for the measured GLM MC2 decode path.
+        enable_moe_native_local_pad_slice = additional_config.get("enable_moe_native_local_pad_slice", False)
+        if not isinstance(enable_moe_native_local_pad_slice, bool):
+            raise ValueError("enable_moe_native_local_pad_slice must be a bool.")
+        if enable_moe_native_local_pad_slice:
+            hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+            parallel_config = vllm_config.parallel_config
+            if (
+                vllm_config.kv_transfer_config is None
+                or vllm_config.kv_transfer_config.kv_role != "kv_consumer"
+                or getattr(hf_config, "model_type", None) != "glm_moe_dsa"
+                or getattr(hf_config, "hidden_size", None) != 6144
+                or getattr(hf_config, "n_routed_experts", None) != 256
+                or parallel_config.tensor_parallel_size != 16
+                or parallel_config.data_parallel_size != 2
+                or not parallel_config.enable_expert_parallel
+                or vllm_config.lora_config is not None
+                or self.enable_fused_mc2 != 0
+            ):
+                raise ValueError(
+                    "enable_moe_native_local_pad_slice requires GLM D kv_consumer, "
+                    "hidden_size=6144, n_routed_experts=256, TP16/DP2/EP, no LoRA and enable_fused_mc2=0."
+                )
+        self.enable_moe_native_local_pad_slice = enable_moe_native_local_pad_slice
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )
