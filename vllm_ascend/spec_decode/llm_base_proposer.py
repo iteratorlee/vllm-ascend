@@ -39,7 +39,6 @@ from vllm.v1.spec_decode.utils import (
     extend_all_queries_by_N,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -67,6 +66,7 @@ from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+_GLM_MTP_NORM_HIDDEN_SIZE = 6144
 
 
 # split hidden states along dimension of sequence
@@ -1307,6 +1307,61 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             logits = self.model.compute_logits(hidden_states)
             return greedy_sample(logits)
 
+    def _can_reuse_mtp_logits_norm(
+        self,
+        logit_hidden_states: torch.Tensor,
+        normalized_hidden_states: torch.Tensor,
+    ) -> bool:
+        """Gate the validated GLM MTP tuple contract without retaining tensors."""
+        ascend_config = get_ascend_config()
+        if not ascend_config.enable_mtp_logits_norm_reuse:
+            return False
+        if (
+            self.method != "mtp"
+            or self.num_speculative_tokens <= 1
+            or self.parallel_drafting
+            or self.use_cuda_graph
+            or self.dcp_size != 1
+            or self.is_multimodal_model
+            or lmhead_tp_enable()
+            or ascend_config.enable_reduce_sample
+            or getattr(_EXTRA_CTX, "flash_comm_v1_enabled", True)
+            or self.vllm_config.lora_config is not None
+        ):
+            return False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None or kv_transfer_config.kv_role != "kv_consumer":
+            return False
+        if self.vllm_config.model_config.hf_text_config.model_type != "glm_moe_dsa":
+            return False
+        if self.runner is None or self.runner.input_batch.lora_id_to_lora_request:
+            return False
+        draft_hf_config = self.draft_model_config.hf_config
+        if (
+            not self.model_returns_tuple()
+            or getattr(draft_hf_config, "num_nextn_predict_layers", None) != 1
+            or logit_hidden_states.shape != normalized_hidden_states.shape
+            or normalized_hidden_states.ndim != 2
+            or normalized_hidden_states.shape[-1] != _GLM_MTP_NORM_HIDDEN_SIZE
+            or normalized_hidden_states.dtype != torch.bfloat16
+            or logit_hidden_states.dtype != normalized_hidden_states.dtype
+            or logit_hidden_states.device != normalized_hidden_states.device
+        ):
+            return False
+        predictor = getattr(self.model, "model", None)
+        return predictor is not None and getattr(predictor, "num_mtp_layers", None) == 1
+
+    def _compute_mtp_logits_from_normalized(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Use the same step-zero head/processor as compute_logits, sans norm.
+
+        The gate restricts this path to a single next-n layer. The caller has
+        selected rows of this forward's already rounded (and biased) normalized
+        return; the separate recycle tensor retains its original ownership.
+        """
+        predictor = self.model.model
+        mtp_layer = predictor.layers[str(predictor.mtp_start_layer_idx)]
+        return predictor.logits_processor(mtp_layer.shared_head.head, hidden_states)
+
     def _run_merged_draft(
         self,
         num_input_tokens,
@@ -1381,7 +1436,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 token_indices_to_sample, (0, max_num_reqs_across_dp - num_indices)
             )
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        reuse_mtp_logits_norm = self._can_reuse_mtp_logits_norm(last_hidden_states, hidden_states)
+        sample_hidden_states = (
+            hidden_states[token_indices_to_sample]
+            if reuse_mtp_logits_norm
+            else last_hidden_states[token_indices_to_sample]
+        )
 
         if get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
@@ -1435,7 +1495,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         logits[:, idx].add_(logits_bias)
                         draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
             else:
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = (
+                    self._compute_mtp_logits_from_normalized(sample_hidden_states)
+                    if reuse_mtp_logits_norm
+                    else self.model.compute_logits(sample_hidden_states)
+                )
                 if lmhead_tp_enable():
                     logits, token_indices_to_sample = self._align_tensor_and_indices(
                         logits,
@@ -1573,7 +1637,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     (0, max_num_reqs_across_dp - num_indices),
                 )
 
-            sample_hidden_states = last_hidden_states[token_indices_to_sample]
+            reuse_mtp_logits_norm = self._can_reuse_mtp_logits_norm(last_hidden_states, hidden_states)
+            sample_hidden_states = (
+                hidden_states[token_indices_to_sample]
+                if reuse_mtp_logits_norm
+                else last_hidden_states[token_indices_to_sample]
+            )
             if get_ascend_config().enable_reduce_sample:
                 if self.method in ("eagle3", "dflash", "dspark", "mtp"):
                     draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
@@ -1591,7 +1660,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         token_indices_to_sample = token_indices_to_sample[:num_indices]
                     draft_token_ids = logits.argmax(dim=-1)
             else:
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = (
+                    self._compute_mtp_logits_from_normalized(sample_hidden_states)
+                    if reuse_mtp_logits_norm
+                    else self.model.compute_logits(sample_hidden_states)
+                )
                 if lmhead_tp_enable() and num_indices < logits.shape[0]:
                     logits = logits[:num_indices]
                     token_indices_to_sample = token_indices_to_sample[:num_indices]

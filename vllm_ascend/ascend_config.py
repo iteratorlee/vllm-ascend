@@ -350,6 +350,17 @@ class AscendConfig:
                 )
         self.enable_mooncake_disjoint_adxl_ports = enable_mooncake_disjoint_adxl_ports
 
+        # Reuse GLM MTP's existing post-final-norm return for logits. The
+        # proposer also gates model, execution mode and hidden-state layout.
+        enable_mtp_logits_norm_reuse = additional_config.get("enable_mtp_logits_norm_reuse", False)
+        if not isinstance(enable_mtp_logits_norm_reuse, bool):
+            raise ValueError("enable_mtp_logits_norm_reuse must be a bool.")
+        self.enable_mtp_logits_norm_reuse = bool(
+            enable_mtp_logits_norm_reuse
+            and use_sparse
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        )
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )
