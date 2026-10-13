@@ -35,6 +35,10 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass
 
+_FINALIZE_TP_SIZE = 16
+_FINALIZE_HIDDEN_WIDTH = 6144
+_FINALIZE_ND_FORMAT = 2
+
 
 class PrepareAndFinalize(ABC):
     """
@@ -235,22 +239,86 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
 class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
     """
     MoE communication strategy using MC2, which is based on All2All. Hence, it inherits
-    All2All and share the same finalize method.
+    All2All and defaults to its finalize method.
     Designed for Ascend or environments requiring explicit padding and slicing control.
     Relies on `mc2_mask` and `padded_num_tokens` from forward_context for alignment.
     """
 
-    def __init__(self, moe_config: FusedMoEConfig, *, enable_native_local_pad_slice: bool = False) -> None:
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        *,
+        enable_native_local_pad_slice: bool = False,
+        enable_finalize_all_gather_into_tensor: bool = False,
+    ) -> None:
         super().__init__(moe_config)
         self._restore_tp_across_dp()
         if not isinstance(enable_native_local_pad_slice, bool):
             raise ValueError("enable_native_local_pad_slice must be a bool.")
+        if not isinstance(enable_finalize_all_gather_into_tensor, bool):
+            raise ValueError("enable_finalize_all_gather_into_tensor must be a bool.")
+        self._finalize_all_gather_into_tensor = enable_finalize_all_gather_into_tensor
         self._native_local_pad_slice = None
         if enable_native_local_pad_slice:
             # Disabled instances keep the original path without importing the helper.
             from vllm_ascend.ops.fused_moe.native_local_pad_slice import maybe_moe_native_local_pad_slice
 
             self._native_local_pad_slice = maybe_moe_native_local_pad_slice
+
+    def _can_finalize_all_gather_into_tensor(
+        self,
+        hidden_states: torch.Tensor,
+        padded_hidden_states_shape: torch.Size | None,
+    ) -> bool:
+        # These are host metadata checks, with no collective or tensor-value read.
+        if (
+            self.replace_allreduce
+            or self.lora_context is not None
+            or self.tp_size != _FINALIZE_TP_SIZE
+            or padded_hidden_states_shape is None
+            or len(padded_hidden_states_shape) != 2
+            or hidden_states.device.type != "npu"
+            or hidden_states.layout != torch.strided
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.ndim != 2
+            or hidden_states.shape[1] != _FINALIZE_HIDDEN_WIDTH
+            or hidden_states.shape[0] <= 0
+            or hidden_states.stride() != (_FINALIZE_HIDDEN_WIDTH, 1)
+            or not hidden_states.is_contiguous()
+            or hidden_states.storage_offset() != 0
+        ):
+            return False
+        padded_rows = padded_hidden_states_shape[0]
+        return (
+            type(padded_rows) is int
+            and type(self.num_tokens) is int
+            and padded_hidden_states_shape[1] == _FINALIZE_HIDDEN_WIDTH
+            and padded_rows == self.tp_size * hidden_states.shape[0]
+            and 0 <= self.num_tokens <= padded_rows
+            and dist.get_world_size(self.moe_config.tp_group.device_group) == self.tp_size
+            and torch_npu.get_npu_format(hidden_states) == _FINALIZE_ND_FORMAT
+        )
+
+    def finalize(
+        self,
+        hidden_states: torch.Tensor,
+        reduce_results: bool,
+        padded_hidden_states_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        if not self._finalize_all_gather_into_tensor or not self._can_finalize_all_gather_into_tensor(
+            hidden_states, padded_hidden_states_shape
+        ):
+            return super().finalize(hidden_states, reduce_results, padded_hidden_states_shape)
+
+        # A fresh output keeps the original input available to shared experts.
+        # Equal rank shards use the same device group and synchronous collective.
+        gathered_hidden_states = torch.empty(
+            padded_hidden_states_shape, device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        dist.all_gather_into_tensor(gathered_hidden_states, hidden_states, self.moe_config.tp_group.device_group)
+        if self.num_tokens < gathered_hidden_states.shape[0]:
+            gathered_hidden_states = gathered_hidden_states[: self.num_tokens]
+        return gathered_hidden_states
 
     def _restore_tp_across_dp(self):
         """

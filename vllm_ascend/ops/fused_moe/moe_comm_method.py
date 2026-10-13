@@ -247,6 +247,7 @@ class MC2CommImpl(MoECommMethod):
         return PrepareAndFinalizeWithMC2(
             self.moe_config,
             enable_native_local_pad_slice=get_ascend_config().enable_moe_native_local_pad_slice,
+            enable_finalize_all_gather_into_tensor=get_ascend_config().enable_moe_finalize_all_gather_into_tensor,
         )
 
 

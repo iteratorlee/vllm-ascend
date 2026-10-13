@@ -330,6 +330,32 @@ class AscendConfig:
                     "hidden_size=6144, n_routed_experts=256, TP16/DP2/EP, no LoRA and enable_fused_mc2=0."
                 )
         self.enable_moe_native_local_pad_slice = enable_moe_native_local_pad_slice
+        # Experimental direct gather into the fresh ordinary-MC2 output buffer.
+        enable_moe_finalize_all_gather_into_tensor = additional_config.get(
+            "enable_moe_finalize_all_gather_into_tensor", False
+        )
+        if not isinstance(enable_moe_finalize_all_gather_into_tensor, bool):
+            raise ValueError("enable_moe_finalize_all_gather_into_tensor must be a bool.")
+        if enable_moe_finalize_all_gather_into_tensor:
+            hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+            parallel_config = vllm_config.parallel_config
+            if (
+                vllm_config.kv_transfer_config is None
+                or vllm_config.kv_transfer_config.kv_role != "kv_consumer"
+                or getattr(hf_config, "model_type", None) != "glm_moe_dsa"
+                or getattr(hf_config, "hidden_size", None) != 6144
+                or getattr(hf_config, "n_routed_experts", None) != 256
+                or parallel_config.tensor_parallel_size != 16
+                or parallel_config.data_parallel_size != 2
+                or not parallel_config.enable_expert_parallel
+                or vllm_config.lora_config is not None
+                or self.enable_fused_mc2 != 0
+            ):
+                raise ValueError(
+                    "enable_moe_finalize_all_gather_into_tensor requires GLM D kv_consumer, "
+                    "hidden_size=6144, n_routed_experts=256, TP16/DP2/EP, no LoRA and enable_fused_mc2=0."
+                )
+        self.enable_moe_finalize_all_gather_into_tensor = enable_moe_finalize_all_gather_into_tensor
         # Startup-only workaround for the current Ascend-direct Mooncake
         # allocator's overlapping inclusive per-device port ranges.
         enable_mooncake_disjoint_adxl_ports = additional_config.get("enable_mooncake_disjoint_adxl_ports", False)
