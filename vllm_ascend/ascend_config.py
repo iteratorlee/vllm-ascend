@@ -387,6 +387,26 @@ class AscendConfig:
             and vllm_config.kv_transfer_config is not None
             and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
+        # Frozen C20 default-off integration.
+        enable_mtp_token_ids_stack = additional_config.get("enable_mtp_token_ids_stack", False)
+        if not isinstance(enable_mtp_token_ids_stack, bool):
+            raise ValueError("enable_mtp_token_ids_stack must be a bool.")
+        self.enable_mtp_token_ids_stack = bool(
+            enable_mtp_token_ids_stack
+            and use_sparse
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        )
+        # Frozen C18 R1 default-off integration.
+        enable_mtp_seq_lens_buffer_reuse = additional_config.get("enable_mtp_seq_lens_buffer_reuse", False)
+        if not isinstance(enable_mtp_seq_lens_buffer_reuse, bool):
+            raise ValueError("enable_mtp_seq_lens_buffer_reuse must be a bool.")
+        self.enable_mtp_seq_lens_buffer_reuse = bool(
+            enable_mtp_seq_lens_buffer_reuse
+            and use_sparse
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+        )
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )

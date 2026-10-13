@@ -67,6 +67,12 @@ from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 _GLM_MTP_NORM_HIDDEN_SIZE = 6144
+_GLM_MTP_METADATA_STEPS = 5
+_GLM_MTP_METADATA_MAX_REQUESTS = 32
+_GLM_MTP_METADATA_MAX_TOKENS = 192
+_GLM_MTP_SEQ_LENS_CAPACITY = 256
+_MTP_TOKEN_IDS_STACK_STEPS = 5
+_MTP_TOKEN_IDS_STACK_MAX_BATCH = 32
 
 
 # split hidden states along dimension of sequence
@@ -1362,6 +1368,41 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         mtp_layer = predictor.layers[str(predictor.mtp_start_layer_idx)]
         return predictor.logits_processor(mtp_layer.shared_head.head, hidden_states)
 
+    def _can_stack_mtp_token_ids(self, draft_token_ids: torch.Tensor, batch_size: int) -> bool:
+        """Restrict collection to fresh argmax results in serial GLM MTP5."""
+        ascend_config = get_ascend_config()
+        if not ascend_config.enable_mtp_token_ids_stack:
+            return False
+        if (
+            self.method != "mtp"
+            or self.num_speculative_tokens != _MTP_TOKEN_IDS_STACK_STEPS
+            or self.parallel_drafting
+            or self.use_cuda_graph
+            or self.dcp_size != 1
+            or self.is_multimodal_model
+            or self.supports_mm_inputs
+            or self.use_compress
+            or lmhead_tp_enable()
+            or ascend_config.enable_reduce_sample
+            or getattr(_EXTRA_CTX, "flash_comm_v1_enabled", True)
+            or self.vllm_config.lora_config is not None
+        ):
+            return False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None or kv_transfer_config.kv_role != "kv_consumer":
+            return False
+        if self.vllm_config.model_config.hf_text_config.model_type != "glm_moe_dsa":
+            return False
+        if self.runner is None or self.runner.input_batch.lora_id_to_lora_request:
+            return False
+        return (
+            0 < batch_size <= _MTP_TOKEN_IDS_STACK_MAX_BATCH
+            and draft_token_ids.shape == (batch_size,)
+            and draft_token_ids.dtype == torch.int64
+            and draft_token_ids.device == self.device
+            and draft_token_ids.is_contiguous()
+        )
+
     def _run_merged_draft(
         self,
         num_input_tokens,
@@ -1527,10 +1568,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             batch_size = draft_token_ids.shape[0]
 
         # Generate the remaining draft tokens.
-        draft_token_ids_tensor = torch.zeros(
-            (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
-        )
-        draft_token_ids_tensor[0] = draft_token_ids
+        stack_mtp_token_ids = self._can_stack_mtp_token_ids(draft_token_ids, batch_size)
+        collected_token_ids: list[torch.Tensor] | None = [draft_token_ids] if stack_mtp_token_ids else None
+        if collected_token_ids is None:
+            draft_token_ids_tensor = torch.zeros(
+                (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
+            )
+            draft_token_ids_tensor[0] = draft_token_ids
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
@@ -1553,7 +1597,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_tensor[draft_index]
+            input_ids = draft_token_ids if collected_token_ids is not None else draft_token_ids_tensor[draft_index]
             positions += 1
 
             # NOTE(woosuk): We should handle the case where the draft model
@@ -1672,9 +1716,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids_tensor[draft_index + 1] = draft_token_ids
+            if collected_token_ids is not None:
+                # The gated path executes Tensor.argmax without an out buffer.
+                # Retain its result; the next model reads a separate input_ids
+                # copy. Only this call owns the list and final stacked storage.
+                collected_token_ids.append(draft_token_ids)
+            else:
+                draft_token_ids_tensor[draft_index + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]
+        if collected_token_ids is not None:
+            draft_token_ids_tensor = torch.stack(collected_token_ids, dim=0)
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
         return draft_token_ids
 
@@ -1856,6 +1908,74 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return "DeepSeekMTPModel" in architectures
         return self.method not in ("mtp", "draft_model", "dflash", "dspark")
 
+    def _can_reuse_mtp_seq_lens_buffer(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+        batch_size: int,
+        input_batch_size: int,
+        aclgraph_runtime_mode: CUDAGraphMode,
+        attn_group: Any,
+    ) -> bool:
+        """Require the serial GLM path and independent per-step storage."""
+        if not get_ascend_config().enable_mtp_seq_lens_buffer_reuse:
+            return False
+        if (
+            self.method != "mtp"
+            or self.num_speculative_tokens != _GLM_MTP_METADATA_STEPS
+            or self.parallel_drafting
+            or self.use_cuda_graph
+            or aclgraph_runtime_mode != CUDAGraphMode.NONE
+            or self.dcp_size != 1
+            or self.runner is None
+            or getattr(self.runner, "dcp_manager", None) is not None
+            or getattr(self.runner, "sparse_kv_offload_enabled", False)
+            or len(self.draft_attn_groups) != 1
+            or attn_group is not self.draft_attn_groups[0]
+            or self.use_compress
+            or self.has_gdn
+            or self.uses_mrope
+            or self.draft_window_size is not None
+            or self.is_multimodal_model
+            or self.vllm_config.lora_config is not None
+        ):
+            return False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None or kv_transfer_config.kv_role != "kv_consumer":
+            return False
+        if self.vllm_config.model_config.hf_text_config.model_type != "glm_moe_dsa":
+            return False
+        if (
+            self.runner.max_num_reqs != _GLM_MTP_METADATA_MAX_REQUESTS
+            or self.runner.max_num_tokens != _GLM_MTP_METADATA_MAX_TOKENS
+            or self.runner.input_batch.lora_id_to_lora_request
+            or getattr(self.draft_model_config.hf_config, "num_nextn_predict_layers", None) != 1
+            or not 0 < draft_index < _GLM_MTP_METADATA_STEPS
+            or not 0 < batch_size <= _GLM_MTP_METADATA_MAX_REQUESTS
+            or not batch_size <= input_batch_size <= _GLM_MTP_METADATA_MAX_TOKENS
+            or common_attn_metadata.num_reqs != batch_size
+            or len(self.seq_lens_group) != _GLM_MTP_METADATA_STEPS
+        ):
+            return False
+        seq_lens = common_attn_metadata.seq_lens
+        if seq_lens.shape != (batch_size,) or seq_lens.dtype != torch.int32 or not seq_lens.is_contiguous():
+            return False
+        for buffer in self.seq_lens_group:
+            if (
+                buffer.shape != (_GLM_MTP_SEQ_LENS_CAPACITY,)
+                or buffer.dtype != seq_lens.dtype
+                or buffer.device != seq_lens.device
+                or not buffer.is_contiguous()
+                or buffer.storage_offset() != 0
+            ):
+                return False
+        storage_ptrs = [buffer.untyped_storage().data_ptr() for buffer in self.seq_lens_group]
+        return (
+            len(set(storage_ptrs)) == _GLM_MTP_METADATA_STEPS
+            and seq_lens.untyped_storage().data_ptr() == storage_ptrs[draft_index - 1]
+            and seq_lens.data_ptr() == self.seq_lens_group[draft_index - 1].data_ptr()
+        )
+
     def attn_update_stack_num_spec_norm(
         self,
         # `draft_index` must start from `1`, no `0`
@@ -1929,7 +2049,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
-        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+        reuse_seq_lens_buffer = self._can_reuse_mtp_seq_lens_buffer(
+            common_attn_metadata, draft_index, batch_size, input_batch_size, aclgraph_runtime_mode, attn_group
+        )
+        if reuse_seq_lens_buffer:
+            # This step's buffer has no consumer until build_for_drafting below.
+            # Snapshot the previous step first, retaining all original integer
+            # updates and CPU mirrors without writing the previous step's view.
+            seq_lens_buffer = self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]]
+            seq_lens_buffer.copy_(common_attn_metadata.seq_lens)
+            common_attn_metadata.seq_lens = seq_lens_buffer
+        else:
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
         if common_attn_metadata.seq_lens_cpu is not None:
             common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
         if common_attn_metadata._seq_lens_cpu is not None:
@@ -2026,7 +2157,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
 
-        self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]].copy_(common_attn_metadata.seq_lens)
+        if not reuse_seq_lens_buffer:
+            self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]].copy_(
+                common_attn_metadata.seq_lens
+            )
         self.seq_lens_group[draft_index][common_attn_metadata.seq_lens.shape[0] :].fill_(0)
         common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]]
 
