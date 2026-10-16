@@ -765,7 +765,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.is_kv_consumer and (
             (qt is AscendW8A8DynamicLinearMethod and self.enable_sparse_sfa_c8)
             or qt is AscendW8A8MXFP8DynamicLinearMethod
-            or qt is None
         ):
             if self._try_enable_type(PreprocessType.PROLOG_V3, act_dtype):
                 return PreprocessType.PROLOG_V3
